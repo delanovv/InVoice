@@ -1,0 +1,227 @@
+#ifndef VOICE_H
+#define VOICE_H
+
+#include "main.h"
+
+#define IPADDRESS "127.0.0.1"
+#define PORT "8080"
+
+using boost::asio::ip::tcp;
+
+struct UDPMessage {
+    std::string message;
+    std::string type;
+    bool isValid;
+    std::string nickname;
+
+    std::string toJSON() const {
+        return "{\"message\": \"" + message + "\", \"type\": \"" + type + "\", \"nickname\": \"" + nickname + "\"}";
+    }
+};
+
+class ConnectionException : public std::runtime_error {
+public:
+    ConnectionException(const std::string& message) : std::runtime_error(message) {}
+};
+
+class VoiceClient {
+public:
+    VoiceClient();
+    ~VoiceClient();
+    void initializeWinSock();
+    void connectToServer(boost::asio::io_context& io_context, tcp::socket& socket);
+    void playSound(const char* buffer, size_t bufferSize);
+    void openMicrophone(UINT selectedMic);
+    void prepareAudioBuffers();
+    void cleanupAudio();
+    void setReadyMic(UINT selectedMic);
+    void startTalkingThread();
+    void stopTalkingThread();
+    void talk();
+
+private:
+    void talkLoop();
+    void Talk();
+    boost::asio::io_context io_context;
+    tcp::socket socket;
+    HWAVEIN wi;
+    char buffers[2][44100 * 2 * 5 / 5];
+    WAVEHDR headers[2];
+    std::thread talkingThread;
+    std::atomic<bool> voiceMoving;
+    std::atomic<bool> threadRunning;
+};
+
+void VoiceClient::initializeWinSock() {
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        exit(1);
+    }
+}
+
+VoiceClient::VoiceClient() : socket(io_context), headers{ {}, {} }, voiceMoving(true), threadRunning(false) {
+    // Инициализация WinSock
+    initializeWinSock();
+
+    // Установка соединения с сервером
+    connectToServer(io_context, socket);
+}
+
+VoiceClient::~VoiceClient() {
+    stopTalkingThread();
+
+    // Остановка и освобождение ресурсов аудио
+    waveInStop(wi);
+    for (int i = 0; i < 2; ++i) {
+        waveInUnprepareHeader(wi, &headers[i], sizeof(headers[i]));
+    }
+    waveInClose(wi);
+    // Очистка WinSock
+    WSACleanup();
+}
+
+void VoiceClient::connectToServer(boost::asio::io_context& io_context, tcp::socket& socket) {
+    try {
+        // Резольвинг IP адреса сервера
+        tcp::resolver resolver(io_context);
+        tcp::resolver::results_type endpoints = resolver.resolve(IPADDRESS, PORT);
+
+        // Подключение к серверу
+        boost::asio::connect(socket, endpoints);
+    }
+    catch (const boost::system::system_error& e) {
+        sampAddChatMessage(e.what());
+    }
+}
+void VoiceClient::playSound(const char* buffer, size_t bufferSize) {
+    WAVEFORMATEX waveFormat;
+    waveFormat.wFormatTag = WAVE_FORMAT_PCM;
+    waveFormat.nChannels = 2;
+    waveFormat.nSamplesPerSec = 44100;
+    waveFormat.nAvgBytesPerSec = 44100 * 2 * 16 / 8;
+    waveFormat.nBlockAlign = 2 * 16 / 8;
+    waveFormat.wBitsPerSample = 16;
+    waveFormat.cbSize = 0;
+
+    HWAVEOUT hWaveOut;
+    WAVEHDR WaveOutHdr;
+
+    waveOutOpen(&hWaveOut, WAVE_MAPPER, &waveFormat, 0L, 0L, WAVE_FORMAT_DIRECT);
+
+    WaveOutHdr.lpData = const_cast<LPSTR>(buffer);
+    WaveOutHdr.dwBufferLength = bufferSize;
+    WaveOutHdr.dwBytesRecorded = 0;
+    WaveOutHdr.dwFlags = 0L;
+
+    waveOutPrepareHeader(hWaveOut, &WaveOutHdr, sizeof(WAVEHDR));
+    waveOutSetVolume(hWaveOut, 0xFFFFFFFF);
+    waveOutWrite(hWaveOut, &WaveOutHdr, sizeof(WAVEHDR));
+    waveOutClose(hWaveOut);
+}
+
+void VoiceClient::openMicrophone(UINT selectedMic) {
+    // Определение формата звука
+    WAVEFORMATEX wfx = {};
+    wfx.wFormatTag = WAVE_FORMAT_PCM;
+    wfx.nChannels = 2;
+    wfx.nSamplesPerSec = 44100;
+    wfx.wBitsPerSample = 16;
+    wfx.nBlockAlign = wfx.wBitsPerSample * wfx.nChannels / 8;
+    wfx.nAvgBytesPerSec = wfx.nBlockAlign * wfx.nSamplesPerSec;
+
+    // Открытие микрофона
+    waveInOpen(&wi, selectedMic, &wfx, NULL, NULL, CALLBACK_NULL | WAVE_FORMAT_DIRECT);
+}
+
+void VoiceClient::prepareAudioBuffers() {
+    // Подготовка буферов для аудио
+    for (int i = 0; i < 2; ++i) {
+        headers[i].lpData = buffers[i];
+        headers[i].dwBufferLength = 44100 * 2 * 5 / 5;
+        waveInPrepareHeader(wi, &headers[i], sizeof(headers[i]));
+        waveInAddBuffer(wi, &headers[i], sizeof(headers[i]));
+    }
+}
+
+void VoiceClient::cleanupAudio() {
+    // Остановка записи с микрофона
+    waveInStop(wi);
+
+    // Освобождение буферов записи
+    for (int i = 0; i < 2; ++i) {
+        waveInUnprepareHeader(wi, &headers[i], sizeof(headers[i]));
+    }
+
+    // Закрытие микрофона
+    waveInClose(wi);
+}
+
+void VoiceClient::setReadyMic(UINT selectedMic) {
+    openMicrophone(selectedMic);
+    prepareAudioBuffers();
+    waveInStart(wi);
+
+    UDPMessage message{ "null", "connect", true, "delanov" };
+    if (socket.is_open())
+        boost::asio::write(socket, boost::asio::buffer(message.toJSON()));
+}
+
+void VoiceClient::startTalkingThread() {
+    if (!threadRunning) {
+        threadRunning = true;
+        talkingThread = std::thread(&VoiceClient::talkLoop, this);
+    }
+}
+
+void VoiceClient::stopTalkingThread() {
+    if (threadRunning) {
+        threadRunning = false;
+        if (talkingThread.joinable()) {
+            talkingThread.join();
+        }
+    }
+}
+
+void VoiceClient::talkLoop() {
+    sampAddChatMessage("запущен поток");
+
+    while (threadRunning) {
+        if (!voiceMoving) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        Talk();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+void VoiceClient::talk() {
+    if (!threadRunning) {
+        startTalkingThread();
+    }
+}
+
+void VoiceClient::Talk() {
+    char buffer[44100 * 2 * 5 / 5];
+    for (auto& h : headers) {
+        if (h.dwFlags & WHDR_DONE) {
+            if (socket.is_open()) {
+                boost::asio::write(socket, boost::asio::buffer(h.lpData, h.dwBufferLength));
+            }
+            h.dwFlags = 0;
+            h.dwBytesRecorded = 0;
+
+            waveInPrepareHeader(wi, &h, sizeof(h));
+            waveInAddBuffer(wi, &h, sizeof(h));
+
+            boost::system::error_code error;
+            size_t length = socket.read_some(boost::asio::buffer(buffer), error);
+
+            if (!error) {
+                playSound(buffer, length);
+            }
+        }
+    }
+}
+
+#endif // VOICE_H
